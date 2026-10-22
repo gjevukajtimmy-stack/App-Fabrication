@@ -1,0 +1,33 @@
+[server]
+enableStaticServing = true
+maxUploadSize = 15
+
+[theme]
+base = "light"
+primaryColor = "#123C9A"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F2F6FB"
+textColor = "#13213C"
+linkColor = "#123C9A"
+borderColor = "#CBD7E6"
+font = "sans-serif"
+headingFont = "sans-serif"
+baseFontSize = 15
+headingFontWeights = [700, 650, 600, 600, 600, 600]
+baseRadius = "0.75rem"
+buttonRadius = "0.75rem"
+showWidgetBorder = true
+showSidebarBorder = true
+paddingTop = "1.5rem"
+paddingBottom = "2rem"
+
+[theme.sidebar]
+backgroundColor = "#F2F6FB"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#13213C"
+borderColor = "#CBD7E6"
+primaryColor = "#123C9A"
+linkColor = "#123C9A"
+paddingTop = "1rem"
+paddingBottom = "1.5rem"
+
