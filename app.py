@@ -30,6 +30,7 @@ import uuid
 from datetime import datetime
 
 import streamlit as st
+from ai_sketch import AnalyseErreur, analyser_croquis, analyser_listing
 
 from domain import (
     UN_SEUL_CONNECTEUR,
@@ -144,6 +145,235 @@ def _reglage(nom, defaut=""):
         return str(st.secrets.get(nom, defaut))
     except Exception:
         return defaut
+
+
+def interface_analyse_croquis(fichier, identifiant, ajouter_au_panier=False, ligne_atelier=None):
+    """Analyse, correction humaine puis insertion dans le panier ou modification atelier."""
+    if fichier is None:
+        st.info("Ajoutez une photo nette du croquis pour commencer.")
+        return
+    if hasattr(fichier, "getvalue"):
+        contenu = fichier.getvalue()
+    else:
+        with open(fichier, "rb") as entree:
+            contenu = entree.read()
+    signature = hashlib.sha256(contenu).hexdigest()
+    cle_resultat = f"resultat_ia_{identifiant}"
+    etat = st.session_state.get(cle_resultat)
+    if etat and etat["signature"] != signature:
+        st.session_state.pop(cle_resultat, None)
+        etat = None
+    st.image(contenu, caption="Croquis soumis à l'analyse", width=320)
+    st.caption("La photo sera transmise au service d'analyse IA uniquement si vous cliquez sur Analyser.")
+    cle_api = _reglage("OPENAI_API_KEY")
+    if not cle_api:
+        st.warning("Analyse indisponible : configurez OPENAI_API_KEY dans les secrets Streamlit.")
+        return
+    if st.button("Analyser le croquis par IA", key=f"lancer_ia_{identifiant}"):
+        with st.spinner("Lecture des cotes et identification de la pièce…"):
+            try:
+                resultat = analyser_croquis(contenu, cle_api, _reglage("OPENAI_VISION_MODEL", "gpt-4.1-mini"))
+            except AnalyseErreur as erreur:
+                st.error(str(erreur))
+            else:
+                st.session_state[cle_resultat] = {"signature": signature, "resultat": resultat}
+                st.rerun()
+    if not etat:
+        return
+    proposition = etat["resultat"]
+    st.info(proposition["explication"] or "Résultat à vérifier manuellement.")
+    for incertitude in proposition["incertitudes"]:
+        st.warning(incertitude)
+    with st.form(f"validation_ia_{identifiant}"):
+        cids = list(CATALOGUE)
+        cid = st.selectbox("Type de pièce proposé", cids, index=cids.index(proposition["cid"]),
+                           format_func=lambda v: f"{v} · {CATALOGUE[v]['titre']}")
+        cotes = {}
+        for cle, lib, valeur_defaut, mini, maxi in CATALOGUE[cid]["cotes"]:
+            proposition_valeur = proposition["cotes"].get(cle)
+            if proposition_valeur is None:
+                st.warning(f"{lib} : non lu — saisie manuelle obligatoire.")
+            cotes[cle] = st.number_input(
+                lib, min_value=float(mini), max_value=float(maxi),
+                value=float(proposition_valeur if proposition_valeur is not None else valeur_defaut),
+                step=1.0, key=f"ia_{identifiant}_{cid}_{cle}",
+            )
+        if ajouter_au_panier:
+            repere = st.text_input("Repère *", value="1")
+            qte = st.number_input("Longueur en ml" if cid == "CID 1" else "Quantité",
+                                  min_value=0.1 if cid == "CID 1" else 1,
+                                  value=1.0 if cid == "CID 1" else (proposition["quantite"] or 1),
+                                  step=0.5 if cid == "CID 1" else 1)
+            con1 = st.selectbox("Connecteur côté 1", CONNECTEURS)
+            con2 = "" if cid in UN_SEUL_CONNECTEUR else st.selectbox("Connecteur côté 2", CONNECTEURS)
+        validation = st.checkbox("J'ai contrôlé les cotes sur le croquis et corrigé les erreurs.")
+        confirmer = st.form_submit_button(
+            "Ajouter au panier" if ajouter_au_panier else "Enregistrer la correction atelier",
+            disabled=not validation, type="primary",
+        )
+    if not confirmer:
+        return
+    if cid == "CID 999":
+        st.error("Pièce non identifiée : utilisez la saisie manuelle sur-mesure.")
+        return
+    if ajouter_au_panier:
+        if not repere.strip() or any(l["repere"].casefold() == repere.strip().casefold()
+                                     for l in st.session_state.panier):
+            st.error("Repère vide ou déjà présent dans le panier.")
+            return
+        from services.media import enregistrer_image
+        photo = enregistrer_image(fichier, DOSSIER_UPLOADS, "croquis_ia")
+        st.session_state.panier.append(dict(
+            repere=repere.strip(), cid=cid, cotes=cotes, epaisseur=EPAISSEUR_DEFAUT,
+            con1=con1, con2=con2, qte=float(qte) if cid == "CID 1" else int(qte), photo=photo,
+        ))
+        st.session_state.panier_chantier = st.session_state.get("chantier", "").strip()
+        enregistrer_brouillon_courant()
+        st.session_state.flash = "Pièce analysée et validée ajoutée au panier."
+    else:
+        ligne_atelier["cid"], ligne_atelier["cotes"] = cid, cotes
+        DB.mettre_a_jour_commande(ligne_atelier)
+        DB.ajouter_audit("atelier", "correction_croquis_ia", ligne_atelier["id"])
+    st.session_state.pop(cle_resultat, None)
+    st.rerun()
+
+
+def interface_analyse_listing(fichier, identifiant, user=None, chantier=None):
+    """Un listing photo -> plusieurs pièces revues -> panier client ou commande atelier."""
+    if fichier is None:
+        st.info("Ajoutez une photo contenant vos différents croquis.")
+        return
+    if hasattr(fichier, "getvalue"):
+        contenu = fichier.getvalue()
+    else:
+        with open(fichier, "rb") as source:
+            contenu = source.read()
+    signature = hashlib.sha256(contenu).hexdigest()
+    cle = f"listing_ia_{identifiant}"
+    etat = st.session_state.get(cle)
+    if etat and etat["signature"] != signature:
+        st.session_state.pop(cle, None)
+        etat = None
+    st.image(contenu, caption="Listing à analyser", width=500)
+    st.caption("La photo est envoyée au service IA uniquement après clic sur Analyser.")
+    cle_api = _reglage("OPENAI_API_KEY")
+    if not cle_api:
+        st.warning("Configurez OPENAI_API_KEY dans les secrets Streamlit pour activer l'analyse.")
+        return
+    if st.button("Analyser toutes les pièces", key=f"analyser_listing_{identifiant}"):
+        with st.spinner("Repérage et lecture des différents dessins…"):
+            try:
+                resultat = analyser_listing(contenu, cle_api, _reglage("OPENAI_VISION_MODEL", "gpt-4.1-mini"))
+            except AnalyseErreur as erreur:
+                st.error(str(erreur))
+            else:
+                st.session_state[cle] = {"signature": signature, "resultat": resultat}
+                st.rerun()
+    if not etat:
+        return
+    resultat = etat["resultat"]
+    propositions = resultat["pieces"]
+    if not propositions:
+        st.error("Aucune pièce identifiée. Essayez une photo plus nette.")
+        return
+    st.metric("Dessins détectés", len(propositions))
+    if not resultat["complet"]:
+        st.error("L'IA ne garantit pas avoir lu toutes les pièces. Comparez avec la photo.")
+    for alerte in resultat["incertitudes_globales"]:
+        st.warning(alerte)
+    st.caption("Vérifiez chaque ligne ; les valeurs proposées pour les cotes non lues ne sont que des exemples à corriger.")
+    revues = []
+    with st.form(f"form_listing_ia_{identifiant}"):
+        for i, proposition in enumerate(propositions):
+            avec = st.container(border=True)
+            with avec:
+                st.markdown(f"**Pièce {i + 1} · {proposition['repere']}**")
+                inclure = st.checkbox("Inclure cette pièce", value=True, key=f"inc_{identifiant}_{i}")
+                cids = list(CATALOGUE)
+                cid = st.selectbox("Type de pièce", cids, index=cids.index(proposition["cid"]),
+                                   format_func=lambda v: f"{v} — {CATALOGUE[v]['titre']}",
+                                   key=f"cid_{identifiant}_{i}")
+                repere = st.text_input("Repère", value=proposition["repere"], key=f"rep_{identifiant}_{i}")
+                cotes = {}
+                for nom, titre, defaut, mini, maxi in CATALOGUE[cid]["cotes"]:
+                    if nom not in proposition["cotes"]:
+                        st.warning(f"{titre} non reconnu : mesure à compléter manuellement.")
+                    cotes[nom] = st.number_input(
+                        titre, min_value=float(mini), max_value=float(maxi),
+                        value=float(proposition["cotes"].get(nom, defaut)), step=1.0,
+                        key=f"cot_{identifiant}_{i}_{cid}_{nom}",
+                    )
+                if cid == "CID 1":
+                    if proposition["longueur_mm"] is None:
+                        st.warning("Longueur d'une gaine non reconnue : à compléter.")
+                    longueur = st.number_input("Longueur unitaire (mm)", min_value=1.0,
+                                              value=float(proposition["longueur_mm"] or 1500),
+                                              step=10.0, key=f"long_{identifiant}_{i}")
+                else:
+                    longueur = None
+                if proposition["quantite"] is None:
+                    st.warning("Quantité non reconnue : à vérifier.")
+                nombre = st.number_input("Quantité de pièces", min_value=1, max_value=10000,
+                                         value=proposition["quantite"] or 1,
+                                         key=f"nb_{identifiant}_{i}")
+                con1 = st.selectbox("Connecteur côté 1", CONNECTEURS, key=f"co1_{identifiant}_{i}")
+                con2 = "" if cid in UN_SEUL_CONNECTEUR else st.selectbox(
+                    "Connecteur côté 2", CONNECTEURS, key=f"co2_{identifiant}_{i}")
+                for incertitude in proposition["incertitudes"]:
+                    st.warning(incertitude)
+                revues.append({"inclure": inclure, "repere": repere.strip(), "cid": cid,
+                               "cotes": cotes, "con1": con1, "con2": con2,
+                               "qte": (nombre * longueur / 1000 if cid == "CID 1" else nombre)})
+        valide = st.checkbox("J'ai vérifié chaque dessin, les pièces oubliées, les dimensions et les quantités.",
+                            key=f"tout_verifie_{identifiant}")
+        ajouter = st.form_submit_button("Valider les pièces sélectionnées", type="primary", disabled=not valide)
+    if not ajouter:
+        return
+    retenues = [x for x in revues if x["inclure"]]
+    reperes = [x["repere"].casefold() for x in retenues]
+    existants = [l["repere"].casefold() for l in st.session_state.panier] if user else []
+    if not retenues or any(not x for x in reperes) or len(set(reperes + existants)) != len(reperes + existants):
+        st.error("Sélection vide, repère manquant ou repères dupliqués. Corrigez les repères.")
+        return
+    if any(x["cid"] == "CID 999" for x in retenues):
+        st.error("Les pièces non identifiées (CID 999) doivent être traitées manuellement.")
+        return
+    # Fichiers distincts : l'envoi standard déplace chaque croquis dans le dossier de commande.
+    if isinstance(fichier, (str, os.PathLike)):
+        extension = os.path.splitext(str(fichier))[1].lower()
+        photo_initiale = os.path.join(DOSSIER_UPLOADS, f"listing_ia_{uuid.uuid4().hex}{extension}")
+        shutil.copy2(fichier, photo_initiale)
+    else:
+        photo_initiale = enregistrer_image(fichier, DOSSIER_UPLOADS, "listing_ia")
+    lignes = []
+    for numero, item in enumerate(retenues):
+        photo = photo_initiale
+        if numero:
+            ext = os.path.splitext(photo_initiale)[1]
+            photo = os.path.join(DOSSIER_UPLOADS, f"listing_ia_{uuid.uuid4().hex}{ext}")
+            shutil.copy2(photo_initiale, photo)
+        lignes.append({"repere": item["repere"], "cid": item["cid"], "cotes": item["cotes"],
+                       "epaisseur": EPAISSEUR_DEFAUT, "con1": item["con1"], "con2": item["con2"],
+                       "qte": item["qte"], "photo": photo})
+    if user:
+        st.session_state.panier.extend(lignes)
+        st.session_state.panier_chantier = chantier
+        enregistrer_brouillon_courant()
+        st.session_state.flash = f"{len(lignes)} pièces vérifiées ajoutées au panier."
+    else:
+        # Conversion atelier en une nouvelle commande, sans écraser le listing photo original.
+        reference = f"CMD-IA-{datetime.now():%Y%m%d}-{uuid.uuid4().hex[:6].upper()}"
+        # L'appelant atelier fournit l'identité propriétaire via chantier (dictionnaire).
+        donnees = chantier
+        commandes = [dict(id=uuid.uuid4().hex[:8], commande_id=reference,
+                          entreprise=donnees["entreprise"], email=donnees["email"],
+                          chantier=donnees["chantier"], date=datetime.now().strftime("%d/%m/%Y %H:%M"),
+                          **ligne) for ligne in lignes]
+        DB.ajouter_commandes(commandes)
+        DB.ajouter_audit("atelier", "listing_ia_converti", reference)
+        st.toast(f"Commande {reference} créée après validation.")
+    st.session_state.pop(cle, None)
+    st.rerun()
 
 
 ADMIN_PASSWORD = _reglage("ADMIN_PASSWORD")
@@ -1004,7 +1234,7 @@ def page_catalogue():
 
     mode = st.segmented_control(
         "Comment souhaitez-vous commander ?",
-        ["Saisie guidée", "Déposer un listing"],
+        ["Saisie guidée", "Analyser un croquis IA", "Analyser un listing IA", "Déposer un listing"],
         key="mode_commande",
         required=True,
         width="stretch",
@@ -1012,6 +1242,23 @@ def page_catalogue():
     )
     if mode == "Déposer un listing":
         depot_listing(user, chantier.strip())
+        barre_panier()
+        return
+
+    if mode == "Analyser un croquis IA":
+        st.subheader("Reconnaissance de croquis", icon=":material/document_scanner:")
+        st.caption("Une pièce par photo. Les cotes reconnues doivent être vérifiées avant l'ajout.")
+        photo_ia = st.file_uploader("Photo du croquis", type=["jpg", "jpeg", "png", "heic", "heif"],
+                                    key="photo_ia_client")
+        interface_analyse_croquis(photo_ia, "client", ajouter_au_panier=True)
+        barre_panier()
+        return
+    if mode == "Analyser un listing IA":
+        st.subheader("Lecture d'un listing complet", icon=":material/document_scanner:")
+        photo_liste = st.file_uploader("Photo de la feuille de croquis",
+                                       type=["jpg", "jpeg", "png", "heic", "heif"],
+                                       key="photo_listing_ia_client")
+        interface_analyse_listing(photo_liste, "client_liste", user=user, chantier=chantier.strip())
         barre_panier()
         return
 
@@ -1489,27 +1736,9 @@ def page_maintenance():
 # ATELIER : COMMANDES ET IA (DÉMO)
 # --------------------------------------------------------------------------
 def bloc_ia(l):
-    """Simulation (mock) de la reconnaissance IA d'un croquis CID 999."""
-    oid = l["id"]
-    if st.button("🤖 Analyser le croquis par IA (Mode Démo)", key=f"ia{oid}"):
-        with st.spinner("Analyse du croquis en cours (simulation)..."):
-            time.sleep(2)
-        st.session_state.ia[oid] = dict(A=300, B=200, ANGLE=90, D=25, F=25)
-    prop = st.session_state.ia.get(oid)
-    if prop:
-        st.info("Proposition (simulation) : **Coude CID 4**. Ajustez si besoin :")
-        champs = [("A", "Largeur A"), ("B", "Hauteur B"), ("ANGLE", "Angle °"),
-                  ("D", "Ext. haute D"), ("F", "Ext. basse F")]
-        vals = {}
-        for col, (cle, lib) in zip(st.columns(5), champs):
-            vals[cle] = col.number_input(lib, min_value=1.0, value=float(prop[cle]),
-                                         max_value=90.0 if cle == "ANGLE" else 10000.0,
-                                         key=f"ia_{cle}_{oid}")
-        if st.button("✅ Valider la proposition", key=f"iaok{oid}"):
-            l["cid"], l["cotes"] = "CID 4", vals
-            DB.mettre_a_jour_commande(l)
-            del st.session_state.ia[oid]
-            st.rerun()
+    """Reconnaissance réelle, avant validation explicite de l'atelier."""
+    if l.get("photo") and os.path.isfile(l["photo"]):
+        interface_analyse_croquis(l["photo"], f"atelier_{l['id']}", ligne_atelier=l)
 
 
 def page_commandes():
@@ -1755,6 +1984,12 @@ def page_commandes():
                     for p in ls["photos"]:
                         if os.path.exists(p):
                             st.image(p, width="stretch", alt="Photo du listing client")
+                            with st.expander("Analyser ce listing par IA", icon=":material/document_scanner:"):
+                                interface_analyse_listing(
+                                    p, f"atelier_liste_{ls['id']}_{hashlib.md5(p.encode()).hexdigest()[:8]}",
+                                    chantier={"entreprise": ls["entreprise"],
+                                              "email": ls["email"], "chantier": ls["chantier"]},
+                                )
                     poids_saisi = st.number_input(
                         "Poids estimé de ce listing (kg)", min_value=0.0,
                         value=float(ls["poids_kg"]), step=1.0, key=f"pl{ls['id']}")
