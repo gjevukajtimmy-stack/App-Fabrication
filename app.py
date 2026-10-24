@@ -31,8 +31,8 @@ from datetime import datetime
 
 import streamlit as st
 from ai_sketch import (AnalyseErreur, analyser_croquis, detecter_regions,
-                       analyser_regions, dessiner_regions, apercu_region,
-                       reperes_manquants, normaliser_regions)
+                       analyser_regions, reperes_manquants)
+from region_editor import preparer_fond, regions_vers_boites, boites_vers_regions
 
 from domain import (
     UN_SEUL_CONNECTEUR,
@@ -276,56 +276,73 @@ def interface_analyse_listing(fichier, identifiant, user=None, chantier=None):
                 for region in regions:
                     region["rid"] = uuid.uuid4().hex[:10]
                 st.session_state[cle] = {"signature": signature, "regions": regions,
-                                        "resultat": None}
+                                        "resultat": None, "rectangles_valides": False,
+                                        "revision": 0}
                 st.rerun()
     if not etat:
         return
     regions = etat["regions"]
-    st.subheader("2 · Vérifier les découpes", icon=":material/crop:")
-    st.image(dessiner_regions(contenu, regions), width=650,
-             caption="Rectangles rouges : zones qui seront analysées individuellement")
-    st.caption("Coordonnées de 0 à 1000 : gauche X1, haut Y1, droite X2, bas Y2. "
-               "Les modifications sont visibles après « Enregistrer les zones ».")
-    with st.form(f"regions_form_{identifiant}"):
-        corrigees = []
-        for i, region in enumerate(regions):
-            rid = region["rid"]
-            with st.expander(f"Zone {i + 1} · repère {region['repere']}", expanded=False):
-                st.image(apercu_region(contenu, region["bbox"]), width=260)
-                conserver = st.checkbox("Conserver cette zone", value=True,
-                                        key=f"garder_region_{identifiant}_{rid}")
-                repere = st.text_input("Repère manuscrit", value=region["repere"],
-                                       key=f"id_region_{identifiant}_{rid}")
-                a, b, c, d = st.columns(4)
-                coords = [a.number_input("X1", 0, 1000, int(region["bbox"][0]),
-                                         key=f"x1_{identifiant}_{rid}"),
-                          b.number_input("Y1", 0, 1000, int(region["bbox"][1]),
-                                         key=f"y1_{identifiant}_{rid}"),
-                          c.number_input("X2", 0, 1000, int(region["bbox"][2]),
-                                         key=f"x2_{identifiant}_{rid}"),
-                          d.number_input("Y2", 0, 1000, int(region["bbox"][3]),
-                                         key=f"y2_{identifiant}_{rid}")]
-                if conserver:
-                    corrigees.append({"repere": repere.strip(), "bbox": coords, "rid": rid})
-        enregistrer_zones = st.form_submit_button("Enregistrer les zones corrigées", type="primary")
-    if enregistrer_zones:
-        valides = normaliser_regions({"regions": corrigees})
-        if len(valides) != len(corrigees) or not valides:
-            st.error("Une ou plusieurs zones ont des coordonnées invalides (X1 < X2, Y1 < Y2).")
+    st.subheader("2 · Déplacer et redimensionner les rectangles", icon=":material/crop:")
+    st.caption("Activez **Modifier** dans la barre du dessin, cliquez sur un rectangle, puis "
+               "glissez-le ou tirez ses poignées. Pour une zone oubliée, passez en mode "
+               "rectangle et dessinez un nouveau cadre.")
+    fond = preparer_fond(contenu)
+    nouveau_repere = st.text_input("Numéro à attribuer aux nouvelles zones",
+                                   value=str(len(regions) + 1),
+                                   key=f"nouveau_repere_canvas_{identifiant}")
+    try:
+        from streamlit_drawable_canvas import st_canvas, boxes_to_drawing
+    except ImportError:
+        st.error("Le composant de dessin manque. Ajoutez streamlit-drawable-canvas==0.13.0 "
+                 "dans requirements.txt et redéployez.")
+        return
+    dessin_initial = boxes_to_drawing(regions_vers_boites(regions, fond.width, fond.height),
+                                      stroke_color="#F01834", stroke_width=2,
+                                      fill_color="rgba(240, 24, 52, 0.10)")
+    canvas = st_canvas(
+        fill_color="rgba(240, 24, 52, 0.10)", stroke_color="#F01834", stroke_width=2,
+        background_image=fond, background_image_fit="stretch",
+        width=fond.width, height=fond.height, drawing_mode="labeled_rect",
+        initial_drawing=dessin_initial, label=nouveau_repere,
+        update_streamlit=True, return_image_data=False,
+        key=f"canvas_listing_{identifiant}_{signature}_{etat.get('revision', 0)}",
+        max_display_height=900,
+    )
+    st.caption("Après les déplacements, cliquez sur « Enregistrer les rectangles ». "
+               "Vous pourrez alors lancer la lecture des dimensions.")
+    if st.button("Enregistrer les rectangles", key=f"enregistrer_rectangles_{identifiant}",
+                 type="primary"):
+        boites = canvas.boxes
+        valides = boites_vers_regions(boites, fond.width, fond.height)
+        if not valides:
+            st.error("Aucun rectangle valide reçu. Attendez l'affichage du dessin et réessayez.")
+        elif len(valides) != len(boites):
+            st.error("Un rectangle est hors de l'image ou trop petit. Corrigez-le à la souris.")
         elif len(valides) > 30:
-            st.error("Maximum 30 zones par feuille.")
+            st.error("Maximum 30 rectangles par feuille.")
         else:
+            for region in valides:
+                region["rid"] = uuid.uuid4().hex[:10]
             etat["regions"] = valides
+            etat["revision"] = etat.get("revision", 0) + 1
             etat["resultat"] = None
+            etat["rectangles_valides"] = True
             st.session_state[cle] = etat
             st.rerun()
-    if st.button("Ajouter une zone oubliée", key=f"ajouter_region_{identifiant}",
-                 disabled=len(regions) >= 30):
-        regions.append({"repere": str(len(regions) + 1), "bbox": (100, 100, 400, 400),
-                        "rid": uuid.uuid4().hex[:10]})
-        etat["resultat"] = None
-        st.rerun()
-    st.info("Vérifiez que chaque dessin possède un seul rectangle, sans zone vide ou regroupement de plusieurs pièces.")
+    if not etat.get("rectangles_valides"):
+        st.warning("Enregistrez les rectangles avant d'analyser les dimensions.")
+        return
+    depuis_canvas = boites_vers_regions(canvas.boxes, fond.width, fond.height)
+    zones_a_jour = (
+        len(depuis_canvas) == len(regions)
+        and all(x["repere"] == y["repere"] and all(
+            abs(a - b) < 1.5 for a, b in zip(x["bbox"], y["bbox"])
+        ) for x, y in zip(depuis_canvas, regions))
+    )
+    if not zones_a_jour:
+        st.warning("Des rectangles ont été modifiés : enregistrez-les avant l'analyse.")
+        return
+    st.success(f"{len(regions)} rectangles enregistrés pour la lecture individuelle.")
     accord_analyse = st.checkbox(
         "J'ai vérifié les rectangles. Je lance maintenant un appel IA payant pour chaque zone conservée.",
         key=f"accord_listing_{identifiant}",
