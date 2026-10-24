@@ -30,7 +30,7 @@ import uuid
 from datetime import datetime
 
 import streamlit as st
-from ai_sketch import AnalyseErreur, analyser_croquis, analyser_listing
+from ai_sketch import AnalyseErreur, analyser_croquis, analyser_listing_v3, reperes_manquants
 
 from domain import (
     UN_SEUL_CONNECTEUR,
@@ -263,10 +263,16 @@ def interface_analyse_listing(fichier, identifiant, user=None, chantier=None):
     if not cle_api:
         st.warning("Configurez OPENAI_API_KEY dans les secrets Streamlit pour activer l'analyse.")
         return
-    if st.button("Analyser toutes les pièces", key=f"analyser_listing_{identifiant}"):
+    accord_analyse = st.checkbox(
+        "Je souhaite lancer l'analyse détaillée (un appel IA pour repérer la feuille, "
+        "puis un appel par dessin détecté).",
+        key=f"accord_listing_{identifiant}",
+    )
+    if st.button("Analyser toutes les pièces", key=f"analyser_listing_{identifiant}",
+                 disabled=not accord_analyse):
         with st.spinner("Repérage et lecture des différents dessins…"):
             try:
-                resultat = analyser_listing(contenu, cle_api, _reglage("OPENAI_VISION_MODEL", "gpt-4.1-mini"))
+                resultat = analyser_listing_v3(contenu, cle_api, _reglage("OPENAI_VISION_MODEL", "gpt-4.1-mini"))
             except AnalyseErreur as erreur:
                 st.error(str(erreur))
             else:
@@ -280,17 +286,27 @@ def interface_analyse_listing(fichier, identifiant, user=None, chantier=None):
         st.error("Aucune pièce identifiée. Essayez une photo plus nette.")
         return
     st.metric("Dessins détectés", len(propositions))
+    st.caption("Chaque dessin a été isolé et analysé séparément. Vérifiez leur nombre et la correspondance des extraits.")
     if not resultat["complet"]:
         st.error("L'IA ne garantit pas avoir lu toutes les pièces. Comparez avec la photo.")
     for alerte in resultat["incertitudes_globales"]:
         st.warning(alerte)
     st.caption("Vérifiez chaque ligne ; les valeurs proposées pour les cotes non lues ne sont que des exemples à corriger.")
+    numeros = sorted(int(x["repere"]) for x in propositions if str(x["repere"]).isdigit())
     revues = []
     with st.form(f"form_listing_ia_{identifiant}"):
+        p1, p2 = st.columns(2)
+        premier = p1.text_input("Premier repère attendu (optionnel)",
+                                value=str(numeros[0]) if numeros else "")
+        dernier = p2.text_input("Dernier repère attendu (optionnel)",
+                                value=str(numeros[-1]) if numeros else "")
+        st.caption("Corrigez ces deux valeurs selon la feuille : elles permettent de retrouver aussi les dessins oubliés en début ou fin de série.")
         for i, proposition in enumerate(propositions):
             avec = st.container(border=True)
             with avec:
                 st.markdown(f"**Pièce {i + 1} · {proposition['repere']}**")
+                if proposition.get("apercu"):
+                    st.image(proposition["apercu"], width=320, caption=f"Découpe du croquis : {proposition['repere']}")
                 inclure = st.checkbox("Inclure cette pièce", value=True, key=f"inc_{identifiant}_{i}")
                 cids = list(CATALOGUE)
                 cid = st.selectbox("Type de pièce", cids, index=cids.index(proposition["cid"]),
@@ -327,6 +343,10 @@ def interface_analyse_listing(fichier, identifiant, user=None, chantier=None):
                 revues.append({"inclure": inclure, "repere": repere.strip(), "cid": cid,
                                "cotes": cotes, "con1": con1, "con2": con2,
                                "qte": (nombre * longueur / 1000 if cid == "CID 1" else nombre)})
+        absences_confirmees = st.checkbox(
+            "Si des repères manquent, je confirme qu'ils ne font pas partie de cette commande.",
+            key=f"absences_confirmees_{identifiant}",
+        )
         valide = st.checkbox("J'ai vérifié chaque dessin, les pièces oubliées, les dimensions et les quantités.",
                             key=f"tout_verifie_{identifiant}")
         ajouter = st.form_submit_button("Valider les pièces sélectionnées", type="primary")
@@ -336,6 +356,18 @@ def interface_analyse_listing(fichier, identifiant, user=None, chantier=None):
         st.error("Cochez la case après avoir vérifié chaque dessin et les quantités.")
         return
     retenues = [x for x in revues if x["inclure"]]
+    if (premier or dernier) and not (premier.isdecimal() and dernier.isdecimal()):
+        st.error("Indiquez deux numéros de repère valides ou laissez les deux champs vides.")
+        return
+    manquants = reperes_manquants(
+        [x["repere"] for x in revues],
+        int(premier) if premier else None,
+        int(dernier) if dernier else None,
+    )
+    if manquants and not absences_confirmees:
+        st.error("Repères manquants : " + ", ".join(map(str, manquants))
+                 + ". Corrigez la détection ou confirmez explicitement leur exclusion.")
+        return
     reperes = [x["repere"].casefold() for x in retenues]
     existants = [l["repere"].casefold() for l in st.session_state.panier] if user else []
     if not retenues or any(not x for x in reperes) or len(set(reperes + existants)) != len(reperes + existants):
