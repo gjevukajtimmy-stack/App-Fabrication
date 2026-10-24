@@ -209,9 +209,12 @@ def interface_analyse_croquis(fichier, identifiant, ajouter_au_panier=False, lig
         validation = st.checkbox("J'ai contrôlé les cotes sur le croquis et corrigé les erreurs.")
         confirmer = st.form_submit_button(
             "Ajouter au panier" if ajouter_au_panier else "Enregistrer la correction atelier",
-            disabled=not validation, type="primary",
+            type="primary",
         )
     if not confirmer:
+        return
+    if not validation:
+        st.error("Cochez la case après avoir vérifié les dimensions du croquis.")
         return
     if cid == "CID 999":
         st.error("Pièce non identifiée : utilisez la saisie manuelle sur-mesure.")
@@ -326,8 +329,11 @@ def interface_analyse_listing(fichier, identifiant, user=None, chantier=None):
                                "qte": (nombre * longueur / 1000 if cid == "CID 1" else nombre)})
         valide = st.checkbox("J'ai vérifié chaque dessin, les pièces oubliées, les dimensions et les quantités.",
                             key=f"tout_verifie_{identifiant}")
-        ajouter = st.form_submit_button("Valider les pièces sélectionnées", type="primary", disabled=not valide)
+        ajouter = st.form_submit_button("Valider les pièces sélectionnées", type="primary")
     if not ajouter:
+        return
+    if not valide:
+        st.error("Cochez la case après avoir vérifié chaque dessin et les quantités.")
         return
     retenues = [x for x in revues if x["inclure"]]
     reperes = [x["repere"].casefold() for x in retenues]
