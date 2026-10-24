@@ -30,7 +30,9 @@ import uuid
 from datetime import datetime
 
 import streamlit as st
-from ai_sketch import AnalyseErreur, analyser_croquis, analyser_listing_v3, reperes_manquants
+from ai_sketch import (AnalyseErreur, analyser_croquis, detecter_regions,
+                       analyser_regions, dessiner_regions, apercu_region,
+                       reperes_manquants, normaliser_regions)
 
 from domain import (
     UN_SEUL_CONNECTEUR,
@@ -257,28 +259,89 @@ def interface_analyse_listing(fichier, identifiant, user=None, chantier=None):
     if etat and etat["signature"] != signature:
         st.session_state.pop(cle, None)
         etat = None
-    st.image(contenu, caption="Listing à analyser", width=500)
-    st.caption("La photo est envoyée au service IA uniquement après clic sur Analyser.")
+    st.image(contenu, caption="Listing d'origine", width=500)
+    st.caption("Étape 1 : détection des zones. Étape 2 : correction des découpes. Étape 3 : analyse des cotes.")
     cle_api = _reglage("OPENAI_API_KEY")
     if not cle_api:
         st.warning("Configurez OPENAI_API_KEY dans les secrets Streamlit pour activer l'analyse.")
         return
-    accord_analyse = st.checkbox(
-        "Je souhaite lancer l'analyse détaillée (un appel IA pour repérer la feuille, "
-        "puis un appel par dessin détecté).",
-        key=f"accord_listing_{identifiant}",
-    )
-    if st.button("Analyser toutes les pièces", key=f"analyser_listing_{identifiant}",
-                 disabled=not accord_analyse):
-        with st.spinner("Repérage et lecture des différents dessins…"):
+    modele = _reglage("OPENAI_VISION_MODEL", "gpt-4.1-mini")
+    if st.button("1 · Détecter les zones (IA)", key=f"detecter_listing_{identifiant}"):
+        with st.spinner("Recherche des différentes zones…"):
             try:
-                resultat = analyser_listing_v3(contenu, cle_api, _reglage("OPENAI_VISION_MODEL", "gpt-4.1-mini"))
+                regions = detecter_regions(contenu, cle_api, modele)
             except AnalyseErreur as erreur:
                 st.error(str(erreur))
             else:
-                st.session_state[cle] = {"signature": signature, "resultat": resultat}
+                for region in regions:
+                    region["rid"] = uuid.uuid4().hex[:10]
+                st.session_state[cle] = {"signature": signature, "regions": regions,
+                                        "resultat": None}
                 st.rerun()
     if not etat:
+        return
+    regions = etat["regions"]
+    st.subheader("2 · Vérifier les découpes", icon=":material/crop:")
+    st.image(dessiner_regions(contenu, regions), width=650,
+             caption="Rectangles rouges : zones qui seront analysées individuellement")
+    st.caption("Coordonnées de 0 à 1000 : gauche X1, haut Y1, droite X2, bas Y2. "
+               "Les modifications sont visibles après « Enregistrer les zones ».")
+    with st.form(f"regions_form_{identifiant}"):
+        corrigees = []
+        for i, region in enumerate(regions):
+            rid = region["rid"]
+            with st.expander(f"Zone {i + 1} · repère {region['repere']}", expanded=False):
+                st.image(apercu_region(contenu, region["bbox"]), width=260)
+                conserver = st.checkbox("Conserver cette zone", value=True,
+                                        key=f"garder_region_{identifiant}_{rid}")
+                repere = st.text_input("Repère manuscrit", value=region["repere"],
+                                       key=f"id_region_{identifiant}_{rid}")
+                a, b, c, d = st.columns(4)
+                coords = [a.number_input("X1", 0, 1000, int(region["bbox"][0]),
+                                         key=f"x1_{identifiant}_{rid}"),
+                          b.number_input("Y1", 0, 1000, int(region["bbox"][1]),
+                                         key=f"y1_{identifiant}_{rid}"),
+                          c.number_input("X2", 0, 1000, int(region["bbox"][2]),
+                                         key=f"x2_{identifiant}_{rid}"),
+                          d.number_input("Y2", 0, 1000, int(region["bbox"][3]),
+                                         key=f"y2_{identifiant}_{rid}")]
+                if conserver:
+                    corrigees.append({"repere": repere.strip(), "bbox": coords, "rid": rid})
+        enregistrer_zones = st.form_submit_button("Enregistrer les zones corrigées", type="primary")
+    if enregistrer_zones:
+        valides = normaliser_regions({"regions": corrigees})
+        if len(valides) != len(corrigees) or not valides:
+            st.error("Une ou plusieurs zones ont des coordonnées invalides (X1 < X2, Y1 < Y2).")
+        elif len(valides) > 30:
+            st.error("Maximum 30 zones par feuille.")
+        else:
+            etat["regions"] = valides
+            etat["resultat"] = None
+            st.session_state[cle] = etat
+            st.rerun()
+    if st.button("Ajouter une zone oubliée", key=f"ajouter_region_{identifiant}",
+                 disabled=len(regions) >= 30):
+        regions.append({"repere": str(len(regions) + 1), "bbox": (100, 100, 400, 400),
+                        "rid": uuid.uuid4().hex[:10]})
+        etat["resultat"] = None
+        st.rerun()
+    st.info("Vérifiez que chaque dessin possède un seul rectangle, sans zone vide ou regroupement de plusieurs pièces.")
+    accord_analyse = st.checkbox(
+        "J'ai vérifié les rectangles. Je lance maintenant un appel IA payant pour chaque zone conservée.",
+        key=f"accord_listing_{identifiant}",
+    )
+    if st.button("3 · Analyser les dimensions des zones vérifiées",
+                 key=f"analyser_listing_{identifiant}", disabled=not accord_analyse):
+        with st.spinner("Lecture des dessins vérifiés…"):
+            try:
+                resultat = analyser_regions(contenu, regions, cle_api, modele)
+            except AnalyseErreur as erreur:
+                st.error(str(erreur))
+            else:
+                etat["resultat"] = resultat
+                st.session_state[cle] = etat
+                st.rerun()
+    if not etat.get("resultat"):
         return
     resultat = etat["resultat"]
     propositions = resultat["pieces"]

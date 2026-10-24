@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageDraw
 try:
     from pillow_heif import register_heif_opener
     register_heif_opener()
@@ -245,7 +245,7 @@ def normaliser_regions(brut: dict) -> list[dict]:
         if not isinstance(region, dict):
             continue
         boite = region.get("bbox")
-        if not isinstance(boite, list) or len(boite) != 4:
+        if not isinstance(boite, (list, tuple)) or len(boite) != 4:
             continue
         try:
             x1, y1, x2, y2 = [float(n) for n in boite]
@@ -256,7 +256,8 @@ def normaliser_regions(brut: dict) -> list[dict]:
         if (x2 - x1) < 10 or (y2 - y1) < 10:
             continue
         regions.append({"repere": str(region.get("repere") or i).strip()[:50],
-                        "bbox": (x1, y1, x2, y2)})
+                        "bbox": (x1, y1, x2, y2),
+                        "rid": str(region.get("rid") or i)[:40]})
     return regions
 
 
@@ -297,8 +298,8 @@ def _decouper_region(image: Image.Image, bbox) -> bytes:
     return sortie.getvalue()
 
 
-def analyser_listing_v3(contenu: bytes, cle_api: str, modele: str = "gpt-4.1-mini") -> dict:
-    """Deux passes : localisation des dessins, puis extraction sur chaque image découpée."""
+def detecter_regions(contenu: bytes, cle_api: str, modele: str = "gpt-4.1-mini") -> list[dict]:
+    """Première passe sans appeler l'analyse détaillée : l'utilisateur pourra corriger."""
     if not cle_api:
         raise AnalyseErreur("Clé OPENAI_API_KEY non configurée.")
     detection = _requete_vision(
@@ -314,6 +315,41 @@ def analyser_listing_v3(contenu: bytes, cle_api: str, modele: str = "gpt-4.1-min
     regions = normaliser_regions(detection)
     if not regions:
         raise AnalyseErreur("Aucun dessin localisé. Essayez une photographie plus nette.")
+    return regions
+
+
+def dessiner_regions(contenu: bytes, regions: list[dict]) -> bytes:
+    """Aperçu des boîtes éditées sur la photo originale."""
+    with Image.open(io.BytesIO(contenu)) as originale:
+        image = ImageOps.exif_transpose(originale).convert("RGB")
+    image.thumbnail((1100, 1600))
+    dessin = ImageDraw.Draw(image)
+    for i, region in enumerate(regions, 1):
+        x1, y1, x2, y2 = region["bbox"]
+        box = (int(x1 * image.width / 1000), int(y1 * image.height / 1000),
+               int(x2 * image.width / 1000), int(y2 * image.height / 1000))
+        dessin.rectangle(box, outline="#E60026", width=3)
+        dessin.text((box[0] + 3, box[1] + 3), f"{i}: {region['repere']}",
+                    fill="#FFFF00", stroke_width=2, stroke_fill="#000000")
+    sortie = io.BytesIO()
+    image.save(sortie, format="PNG")
+    return sortie.getvalue()
+
+
+def apercu_region(contenu: bytes, bbox) -> bytes:
+    with Image.open(io.BytesIO(contenu)) as originale:
+        image = ImageOps.exif_transpose(originale).convert("RGB")
+    return _decouper_region(image, bbox)
+
+
+def analyser_regions(contenu: bytes, regions: list[dict], cle_api: str,
+                    modele: str = "gpt-4.1-mini") -> dict:
+    """Seconde passe, déclenchée uniquement après validation des régions."""
+    if not cle_api:
+        raise AnalyseErreur("Clé OPENAI_API_KEY non configurée.")
+    regions = normaliser_regions({"regions": regions})
+    if not regions:
+        raise AnalyseErreur("Aucune zone valide à analyser.")
     with Image.open(io.BytesIO(contenu)) as originale:
         image = ImageOps.exif_transpose(originale).convert("RGB")
     extraits = [_decouper_region(image, region["bbox"]) for region in regions]
@@ -367,3 +403,8 @@ def analyser_listing_v3(contenu: bytes, cle_api: str, modele: str = "gpt-4.1-min
     return {"pieces": resultat, "incertitudes_globales": alertes,
             "complet": len(regions) < 30 and not manquants,
             "regions_detectees": len(regions), "reperes_manquants": manquants}
+
+
+def analyser_listing_v3(contenu: bytes, cle_api: str, modele: str = "gpt-4.1-mini") -> dict:
+    """Compatibilité V3 ; la nouvelle interface utilise les deux fonctions séparées."""
+    return analyser_regions(contenu, detecter_regions(contenu, cle_api, modele), cle_api, modele)
